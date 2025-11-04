@@ -73,6 +73,16 @@ class Config:
         'tds': '#4444FF',
         'soil': '#FFAA44'
     }
+    
+    # SNN (Spiking Neural Network) Configuration
+    SNN_INPUT_NEURONS = 16  # 4 sensors × 4 encoding types
+    SNN_HIDDEN_NEURONS = 32
+    SNN_OUTPUT_NEURONS = 8  # Decision outputs
+    SNN_THRESHOLD = 1.0  # Neuron firing threshold
+    SNN_DECAY_RATE = 0.95  # Membrane potential decay
+    SNN_LEARNING_RATE = 0.01
+    SNN_REFRACTORY_PERIOD = 5  # ms
+    SNN_STDP_WINDOW = 20  # ms for spike-timing dependent plasticity
 
 
 # =============================================================================
@@ -404,6 +414,307 @@ class CSVLogger:
 
 
 # =============================================================================
+# SPIKING NEURAL NETWORK (SNN) - CORE BRAIN
+# =============================================================================
+
+class SpikingNeuron:
+    """Individual Leaky Integrate-and-Fire (LIF) neuron model"""
+    
+    def __init__(self, neuron_id: int, threshold: float = 1.0, 
+                 decay: float = 0.95, refractory: int = 5):
+        """Initialize LIF neuron"""
+        self.neuron_id = neuron_id
+        self.threshold = threshold
+        self.decay = decay
+        self.refractory_period = refractory
+        
+        # State variables
+        self.membrane_potential = 0.0
+        self.last_spike_time = -float('inf')
+        self.refractory_counter = 0
+        self.spike_times = deque(maxlen=100)
+    
+    def integrate(self, input_current: float, current_time: float) -> bool:
+        """
+        Integrate input current and check for spike
+        
+        Args:
+            input_current: Synaptic input current
+            current_time: Current simulation time (ms)
+            
+        Returns:
+            True if neuron fires, False otherwise
+        """
+        # Check refractory period
+        if self.refractory_counter > 0:
+            self.refractory_counter -= 1
+            return False
+        
+        # Leak membrane potential
+        self.membrane_potential *= self.decay
+        
+        # Add input current
+        self.membrane_potential += input_current
+        
+        # Check threshold
+        if self.membrane_potential >= self.threshold:
+            self.membrane_potential = 0.0
+            self.last_spike_time = current_time
+            self.spike_times.append(current_time)
+            self.refractory_counter = self.refractory_period
+            return True
+        
+        return False
+    
+    def reset(self):
+        """Reset neuron state"""
+        self.membrane_potential = 0.0
+        self.refractory_counter = 0
+
+
+class SNNLayer:
+    """Layer of spiking neurons with STDP learning"""
+    
+    def __init__(self, n_input: int, n_neurons: int, learning_rate: float = 0.01):
+        """Initialize SNN layer"""
+        self.n_input = n_input
+        self.n_neurons = n_neurons
+        self.learning_rate = learning_rate
+        
+        # Create neurons
+        self.neurons = [SpikingNeuron(i) for i in range(n_neurons)]
+        
+        # Synaptic weights (input × neurons)
+        self.weights = np.random.randn(n_input, n_neurons) * 0.1
+        self.weights = np.clip(self.weights, -1.0, 1.0)
+        
+        # STDP traces
+        self.pre_trace = np.zeros(n_input)
+        self.post_trace = np.zeros(n_neurons)
+        
+        # Activity tracking
+        self.last_output_spikes = np.zeros(n_neurons)
+    
+    def forward(self, input_spikes: np.ndarray, current_time: float) -> np.ndarray:
+        """
+        Forward propagation through layer
+        
+        Args:
+            input_spikes: Binary spike vector (1=spike, 0=no spike)
+            current_time: Current time in ms
+            
+        Returns:
+            Binary output spike vector
+        """
+        output_spikes = np.zeros(self.n_neurons)
+        
+        # Compute synaptic currents
+        synaptic_currents = np.dot(input_spikes, self.weights)
+        
+        # Process each neuron
+        for i, neuron in enumerate(self.neurons):
+            fired = neuron.integrate(synaptic_currents[i], current_time)
+            output_spikes[i] = 1.0 if fired else 0.0
+        
+        self.last_output_spikes = output_spikes
+        return output_spikes
+    
+    def stdp_update(self, input_spikes: np.ndarray, output_spikes: np.ndarray):
+        """
+        Spike-Timing Dependent Plasticity (STDP) weight update
+        
+        Args:
+            input_spikes: Pre-synaptic spike vector
+            output_spikes: Post-synaptic spike vector
+        """
+        # Update traces (exponential decay)
+        self.pre_trace *= 0.9
+        self.post_trace *= 0.9
+        
+        # Add new spikes to traces
+        self.pre_trace += input_spikes
+        self.post_trace += output_spikes
+        
+        # STDP: potentiation (pre before post)
+        for i in range(self.n_input):
+            for j in range(self.n_neurons):
+                if output_spikes[j] > 0:
+                    self.weights[i, j] += self.learning_rate * self.pre_trace[i]
+        
+        # STDP: depression (post before pre)
+        for i in range(self.n_input):
+            for j in range(self.n_neurons):
+                if input_spikes[i] > 0:
+                    self.weights[i, j] -= self.learning_rate * self.post_trace[j] * 0.5
+        
+        # Clip weights
+        self.weights = np.clip(self.weights, -1.0, 1.0)
+
+
+class AgricultureSNN:
+    """Spiking Neural Network for Agricultural Decision Making"""
+    
+    def __init__(self):
+        """Initialize multi-layer SNN"""
+        print("\n[SNN] Initializing Spiking Neural Network Brain...")
+        
+        # Network layers
+        self.input_layer = SNNLayer(
+            Config.SNN_INPUT_NEURONS,
+            Config.SNN_HIDDEN_NEURONS,
+            Config.SNN_LEARNING_RATE
+        )
+        
+        self.hidden_layer = SNNLayer(
+            Config.SNN_HIDDEN_NEURONS,
+            Config.SNN_OUTPUT_NEURONS,
+            Config.SNN_LEARNING_RATE
+        )
+        
+        # Input encoding map (sensor × encoding → neuron index)
+        self.input_map = self._build_input_map()
+        
+        # Output decision neurons
+        self.decision_labels = [
+            'irrigation_needed',
+            'nutrient_deficiency',
+            'optimal_conditions',
+            'temperature_alert',
+            'humidity_alert',
+            'soil_dry',
+            'water_quality_low',
+            'system_healthy'
+        ]
+        
+        # Simulation state
+        self.current_time = 0.0
+        self.spike_count = 0
+        
+        # Decision history
+        self.decision_history = deque(maxlen=100)
+        self.current_decisions = {label: 0.0 for label in self.decision_labels}
+        
+        print(f"[SNN] Network: {Config.SNN_INPUT_NEURONS} → {Config.SNN_HIDDEN_NEURONS} → {Config.SNN_OUTPUT_NEURONS}")
+        print("[SNN] Learning: STDP (Spike-Timing Dependent Plasticity)")
+        print("[SNN] Initialized successfully")
+    
+    def _build_input_map(self) -> Dict[str, int]:
+        """Build mapping from (sensor, encoding) to input neuron index"""
+        input_map = {}
+        idx = 0
+        for sensor in Config.SENSOR_NAMES:
+            for encoding in Config.ENCODING_NAMES:
+                input_map[f"{sensor}_{encoding}"] = idx
+                idx += 1
+        return input_map
+    
+    def process_spike(self, spike: SpikeEvent) -> Dict[str, float]:
+        """
+        Process incoming spike through SNN and generate decisions
+        
+        Args:
+            spike: Incoming spike event from transmitter
+            
+        Returns:
+            Dictionary of decision activations
+        """
+        # Create input spike vector
+        input_spikes = np.zeros(Config.SNN_INPUT_NEURONS)
+        
+        # Encode spike into input vector
+        key = f"{spike.sensor_id}_{spike.encoding_type}"
+        if key in self.input_map:
+            neuron_idx = self.input_map[key]
+            input_spikes[neuron_idx] = 1.0 if spike.polarity > 0 else 0.0
+        
+        # Forward propagation
+        hidden_spikes = self.input_layer.forward(input_spikes, self.current_time)
+        output_spikes = self.hidden_layer.forward(hidden_spikes, self.current_time)
+        
+        # STDP learning
+        self.input_layer.stdp_update(input_spikes, hidden_spikes)
+        self.hidden_layer.stdp_update(hidden_spikes, output_spikes)
+        
+        # Update decisions (exponential moving average)
+        alpha = 0.1
+        for i, label in enumerate(self.decision_labels):
+            self.current_decisions[label] = \
+                (1 - alpha) * self.current_decisions[label] + alpha * output_spikes[i]
+        
+        # Increment time
+        self.current_time += 1.0
+        self.spike_count += 1
+        
+        # Store decision snapshot
+        if self.spike_count % 10 == 0:
+            self.decision_history.append({
+                'time': time.time(),
+                'decisions': self.current_decisions.copy()
+            })
+        
+        return self.current_decisions
+    
+    def get_top_decisions(self, threshold: float = 0.3) -> List[Tuple[str, float]]:
+        """
+        Get active decisions above threshold
+        
+        Args:
+            threshold: Minimum activation level
+            
+        Returns:
+            List of (decision_label, activation) tuples
+        """
+        active_decisions = [
+            (label, activation)
+            for label, activation in self.current_decisions.items()
+            if activation > threshold
+        ]
+        return sorted(active_decisions, key=lambda x: x[1], reverse=True)
+    
+    def get_recommendation(self) -> str:
+        """
+        Generate human-readable agricultural recommendation
+        
+        Returns:
+            Recommendation string
+        """
+        top_decisions = self.get_top_decisions(threshold=0.3)
+        
+        if not top_decisions:
+            return "System monitoring... All parameters within normal range."
+        
+        recommendations = []
+        for decision, strength in top_decisions[:3]:
+            if decision == 'irrigation_needed':
+                recommendations.append(f"💧 Irrigation recommended (confidence: {strength:.1%})")
+            elif decision == 'nutrient_deficiency':
+                recommendations.append(f"🌿 Check nutrient levels (confidence: {strength:.1%})")
+            elif decision == 'temperature_alert':
+                recommendations.append(f"🌡️  Temperature out of range (confidence: {strength:.1%})")
+            elif decision == 'humidity_alert':
+                recommendations.append(f"💨 Humidity adjustment needed (confidence: {strength:.1%})")
+            elif decision == 'soil_dry':
+                recommendations.append(f"🏜️  Soil moisture low (confidence: {strength:.1%})")
+            elif decision == 'water_quality_low':
+                recommendations.append(f"💦 Water quality check needed (confidence: {strength:.1%})")
+            elif decision == 'optimal_conditions':
+                recommendations.append(f"✅ Optimal growing conditions (confidence: {strength:.1%})")
+            elif decision == 'system_healthy':
+                recommendations.append(f"✅ System healthy (confidence: {strength:.1%})")
+        
+        return "\n".join(recommendations) if recommendations else "Analyzing data..."
+    
+    def reset(self):
+        """Reset SNN state"""
+        for neuron in self.input_layer.neurons:
+            neuron.reset()
+        for neuron in self.hidden_layer.neurons:
+            neuron.reset()
+        self.current_time = 0.0
+        self.spike_count = 0
+
+
+# =============================================================================
 # REAL-TIME VISUALIZER
 # =============================================================================
 
@@ -411,11 +722,12 @@ class RealtimeVisualizer:
     """Modern real-time spike visualization dashboard"""
     
     def __init__(self, receiver: RF24Receiver, metrics: SpikeMetrics, 
-                 logger: Optional[CSVLogger] = None):
+                 logger: Optional[CSVLogger] = None, snn: Optional[AgricultureSNN] = None):
         """Initialize visualizer components"""
         self.receiver = receiver
         self.metrics = metrics
         self.logger = logger
+        self.snn = snn
         
         # Data storage
         self.spike_history: Dict[str, List[dict]] = defaultdict(list)
@@ -535,6 +847,10 @@ class RealtimeVisualizer:
             if self.logger:
                 self.logger.log_spike(spike)
             
+            # Feed spike into SNN for intelligent decision-making
+            if self.snn:
+                self.snn.process_spike(spike)
+            
             # Handle raw data separately
             if spike.is_raw_data:
                 self.raw_values[spike.sensor_id] = spike.polarity
@@ -642,6 +958,20 @@ class RealtimeVisualizer:
                 lines.append(f"│ {sensor:5s}: {rate:3.0f} Hz          │")
         
         lines.append(f"│ Total: {total_rate:3.0f} Hz           │")
+        
+        # SNN Decisions
+        if self.snn:
+            lines.append("╠═══ SNN DECISIONS ═════════╣")
+            top_decisions = self.snn.get_top_decisions(threshold=0.2)
+            if top_decisions:
+                for decision, strength in top_decisions[:3]:
+                    label = decision.replace('_', ' ').title()[:15]
+                    bar_length = int(strength * 10)
+                    bar = '█' * bar_length + '░' * (10 - bar_length)
+                    lines.append(f"│ {label:15s} {bar} │")
+            else:
+                lines.append("│ Analyzing patterns...     │")
+        
         lines.append("╚═══════════════════════════╝")
         
         self.metrics_text.set_text('\n'.join(lines))
@@ -699,12 +1029,15 @@ def main():
     receiver = RF24Receiver()
     metrics = SpikeMetrics()
     
+    # Initialize SNN Brain
+    snn = AgricultureSNN()
+    
     # Setup logging
     log_filename = args.log or f"rf24_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     logger = CSVLogger(log_filename)
     
-    # Create visualizer
-    visualizer = RealtimeVisualizer(receiver, metrics, logger)
+    # Create visualizer with SNN
+    visualizer = RealtimeVisualizer(receiver, metrics, logger, snn)
     
     # Connect to hardware
     if not receiver.connect():
@@ -720,6 +1053,8 @@ def main():
     print("="*50)
     print(f"📝 Logging to: {log_filename}")
     print("📡 Waiting for Pico transmitter...")
+    print(f"🧠 SNN Brain: {Config.SNN_INPUT_NEURONS}→{Config.SNN_HIDDEN_NEURONS}→{Config.SNN_OUTPUT_NEURONS} neurons")
+    print("🎯 Decision-making: ACTIVE")
     print("Press Ctrl+C to stop")
     print("="*50 + "\n")
     
