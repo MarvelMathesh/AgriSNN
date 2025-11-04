@@ -28,6 +28,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
+# GPIO for relay control
+try:
+    import RPi.GPIO as GPIO
+    HAS_GPIO = True
+except ImportError:
+    print("[WARNING] RPi.GPIO not found - relay control disabled")
+    HAS_GPIO = False
+
 # RF24 library import
 try:
     from RF24 import RF24, RF24_PA_LOW, RF24_250KBPS
@@ -83,6 +91,13 @@ class Config:
     SNN_LEARNING_RATE = 0.01
     SNN_REFRACTORY_PERIOD = 5  # ms
     SNN_STDP_WINDOW = 20  # ms for spike-timing dependent plasticity
+    
+    # Relay Control Configuration
+    RELAY_PIN = 17  # GPIO17 for water pump relay
+    SOIL_MOISTURE_LOW_THRESHOLD = 30.0  # % - Turn ON irrigation
+    SOIL_MOISTURE_HIGH_THRESHOLD = 70.0  # % - Turn OFF irrigation
+    RELAY_CHECK_INTERVAL = 2.0  # seconds between checks
+    RELAY_ACTIVE_LOW = False  # Set True if relay is active-low
 
 
 # =============================================================================
@@ -414,6 +429,134 @@ class CSVLogger:
 
 
 # =============================================================================
+# IRRIGATION RELAY CONTROLLER
+# =============================================================================
+
+class IrrigationController:
+    """GPIO relay controller for automatic irrigation based on soil moisture"""
+    
+    def __init__(self):
+        """Initialize GPIO relay controller"""
+        self.relay_pin = Config.RELAY_PIN
+        self.low_threshold = Config.SOIL_MOISTURE_LOW_THRESHOLD
+        self.high_threshold = Config.SOIL_MOISTURE_HIGH_THRESHOLD
+        self.active_low = Config.RELAY_ACTIVE_LOW
+        
+        # State tracking
+        self.relay_active = False
+        self.current_soil_moisture = None
+        self.last_check_time = 0
+        self.activation_count = 0
+        self.total_active_time = 0.0
+        self.last_activation_time = None
+        
+        # Initialize GPIO
+        if HAS_GPIO:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(self.relay_pin, GPIO.OUT)
+                self._turn_off()  # Start with relay OFF
+                print(f"\n[RELAY] Initialized on GPIO{self.relay_pin}")
+                print(f"[RELAY] Low threshold: {self.low_threshold}% (Turn ON)")
+                print(f"[RELAY] High threshold: {self.high_threshold}% (Turn OFF)")
+                print(f"[RELAY] Mode: {'Active-LOW' if self.active_low else 'Active-HIGH'}")
+            except Exception as e:
+                print(f"[ERROR] GPIO initialization failed: {e}")
+                raise
+        else:
+            print("[WARNING] GPIO not available - relay control in simulation mode")
+    
+    def _turn_on(self):
+        """Turn relay ON (activate water pump)"""
+        if HAS_GPIO:
+            GPIO.output(self.relay_pin, GPIO.LOW if self.active_low else GPIO.HIGH)
+        self.relay_active = True
+        self.last_activation_time = time.time()
+        self.activation_count += 1
+        print(f"\n💧 [RELAY] IRRIGATION STARTED (Soil: {self.current_soil_moisture:.1f}%)")
+    
+    def _turn_off(self):
+        """Turn relay OFF (deactivate water pump)"""
+        if HAS_GPIO:
+            GPIO.output(self.relay_pin, GPIO.HIGH if self.active_low else GPIO.LOW)
+        
+        # Track active time
+        if self.relay_active and self.last_activation_time:
+            duration = time.time() - self.last_activation_time
+            self.total_active_time += duration
+            print(f"\n⏸️  [RELAY] IRRIGATION STOPPED (Duration: {duration:.1f}s, Soil: {self.current_soil_moisture:.1f}%)")
+        
+        self.relay_active = False
+        self.last_activation_time = None
+    
+    def update(self, soil_moisture: float) -> bool:
+        """Update relay state based on soil moisture with hysteresis
+        
+        Args:
+            soil_moisture: Current soil moisture percentage (0-100)
+            
+        Returns:
+            True if relay state changed, False otherwise
+        """
+        current_time = time.time()
+        
+        # Rate limiting
+        if current_time - self.last_check_time < Config.RELAY_CHECK_INTERVAL:
+            return False
+        
+        self.last_check_time = current_time
+        self.current_soil_moisture = soil_moisture
+        state_changed = False
+        
+        # Hysteresis logic to prevent rapid cycling
+        if not self.relay_active:
+            # Relay is OFF - check if soil is too dry
+            if soil_moisture < self.low_threshold:
+                self._turn_on()
+                state_changed = True
+        else:
+            # Relay is ON - check if soil is sufficiently wet
+            if soil_moisture >= self.high_threshold:
+                self._turn_off()
+                state_changed = True
+        
+        return state_changed
+    
+    def get_status(self) -> Dict[str, any]:
+        """Get current relay status"""
+        return {
+            'active': self.relay_active,
+            'soil_moisture': self.current_soil_moisture,
+            'activation_count': self.activation_count,
+            'total_active_time': self.total_active_time,
+            'current_duration': time.time() - self.last_activation_time if self.last_activation_time else 0
+        }
+    
+    def manual_override(self, state: bool):
+        """Manually control relay state
+        
+        Args:
+            state: True to turn ON, False to turn OFF
+        """
+        if state and not self.relay_active:
+            self._turn_on()
+            print("[RELAY] Manual override: ON")
+        elif not state and self.relay_active:
+            self._turn_off()
+            print("[RELAY] Manual override: OFF")
+    
+    def cleanup(self):
+        """Cleanup GPIO resources"""
+        if self.relay_active:
+            self._turn_off()
+        
+        if HAS_GPIO:
+            GPIO.cleanup(self.relay_pin)
+            print("[RELAY] GPIO cleaned up")
+
+
+# =============================================================================
 # SPIKING NEURAL NETWORK (SNN) - CORE BRAIN
 # =============================================================================
 
@@ -722,12 +865,14 @@ class RealtimeVisualizer:
     """Modern real-time spike visualization dashboard"""
     
     def __init__(self, receiver: RF24Receiver, metrics: SpikeMetrics, 
-                 logger: Optional[CSVLogger] = None, snn: Optional[AgricultureSNN] = None):
+                 logger: Optional[CSVLogger] = None, snn: Optional[AgricultureSNN] = None,
+                 relay: Optional[IrrigationController] = None):
         """Initialize visualizer components"""
         self.receiver = receiver
         self.metrics = metrics
         self.logger = logger
         self.snn = snn
+        self.relay = relay
         
         # Data storage
         self.spike_history: Dict[str, List[dict]] = defaultdict(list)
@@ -858,6 +1003,10 @@ class RealtimeVisualizer:
                     'time': current_time,
                     'value': spike.polarity
                 })
+                
+                # Trigger relay for soil moisture control
+                if spike.sensor_id == 'soil' and self.relay:
+                    self.relay.update(spike.polarity)
             else:
                 # Add to metrics
                 self.metrics.add_spike(spike)
@@ -940,12 +1089,33 @@ class RealtimeVisualizer:
                 icon = icons.get(sensor, '')
                 unit = units.get(sensor, '')
                 
-                if sensor == 'tds':
-                    lines.append(f"│ {icon} {sensor.upper():5s}: {value:5.0f} {unit:<7}│")
+                # Highlight soil moisture with relay status
+                if sensor == 'soil' and self.relay:
+                    relay_icon = '💦' if self.relay.relay_active else '  '
+                    if sensor == 'tds':
+                        lines.append(f"│ {icon} {sensor.upper():5s}: {value:5.0f} {unit:<7}│")
+                    else:
+                        lines.append(f"│ {icon} {sensor.capitalize():5s}: {value:5.1f} {unit} {relay_icon}│")
                 else:
-                    lines.append(f"│ {icon} {sensor.capitalize():5s}: {value:5.1f} {unit:<7}│")
+                    if sensor == 'tds':
+                        lines.append(f"│ {icon} {sensor.upper():5s}: {value:5.0f} {unit:<7}│")
+                    else:
+                        lines.append(f"│ {icon} {sensor.capitalize():5s}: {value:5.1f} {unit:<7}│")
             else:
                 lines.append(f"│ {sensor}: No data            │")
+        
+        # Relay status
+        if self.relay:
+            lines.append("╠═══ IRRIGATION RELAY ═══════╣")
+            status = self.relay.get_status()
+            relay_state = "ON 💦" if status['active'] else "OFF"
+            lines.append(f"│ Status: {relay_state:18s} │")
+            if status['soil_moisture'] is not None:
+                lines.append(f"│ Threshold: {self.relay.low_threshold:.0f}%-{self.relay.high_threshold:.0f}%        │")
+            lines.append(f"│ Activations: {status['activation_count']:<13} │")
+            if status['active']:
+                duration = status['current_duration']
+                lines.append(f"│ Running: {duration:5.0f}s           │")
         
         lines.append("╠═══ SPIKE ACTIVITY ═════════╣")
         
@@ -1032,12 +1202,20 @@ def main():
     # Initialize SNN Brain
     snn = AgricultureSNN()
     
+    # Initialize Irrigation Relay Controller
+    relay = None
+    try:
+        relay = IrrigationController()
+    except Exception as e:
+        print(f"[WARNING] Relay initialization failed: {e}")
+        print("[INFO] Continuing without relay control")
+    
     # Setup logging
     log_filename = args.log or f"rf24_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     logger = CSVLogger(log_filename)
     
-    # Create visualizer with SNN
-    visualizer = RealtimeVisualizer(receiver, metrics, logger, snn)
+    # Create visualizer with SNN and relay
+    visualizer = RealtimeVisualizer(receiver, metrics, logger, snn, relay)
     
     # Connect to hardware
     if not receiver.connect():
@@ -1055,6 +1233,8 @@ def main():
     print("📡 Waiting for Pico transmitter...")
     print(f"🧠 SNN Brain: {Config.SNN_INPUT_NEURONS}→{Config.SNN_HIDDEN_NEURONS}→{Config.SNN_OUTPUT_NEURONS} neurons")
     print("🎯 Decision-making: ACTIVE")
+    if relay:
+        print(f"💧 Irrigation Relay: GPIO{Config.RELAY_PIN} ({Config.SOIL_MOISTURE_LOW_THRESHOLD}%-{Config.SOIL_MOISTURE_HIGH_THRESHOLD}%)")
     print("Press Ctrl+C to stop")
     print("="*50 + "\n")
     
@@ -1067,6 +1247,8 @@ def main():
         # Cleanup
         receiver.stop()
         logger.close()
+        if relay:
+            relay.cleanup()
         print("[EXIT] Shutdown complete")
 
 
