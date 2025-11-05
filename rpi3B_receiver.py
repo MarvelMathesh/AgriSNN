@@ -88,9 +88,10 @@ class Config:
     SNN_OUTPUT_NEURONS = 8  # Decision outputs
     SNN_THRESHOLD = 1.0  # Neuron firing threshold
     SNN_DECAY_RATE = 0.95  # Membrane potential decay
-    SNN_LEARNING_RATE = 0.01
+    SNN_LEARNING_RATE = 0.05  # Increased from 0.01 for faster learning
     SNN_REFRACTORY_PERIOD = 5  # ms
     SNN_STDP_WINDOW = 20  # ms for spike-timing dependent plasticity
+    SNN_WARMUP_PERIOD = 300  # seconds (5 min) for initial pattern learning
     
     # Relay Control Configuration
     RELAY_PIN = 17  # GPIO17 for water pump relay
@@ -474,7 +475,7 @@ class IrrigationController:
         self.relay_active = True
         self.last_activation_time = time.time()
         self.activation_count += 1
-        print(f"\n💧 [RELAY] IRRIGATION STARTED (Soil: {self.current_soil_moisture:.1f}%)")
+        print(f"\n[RELAY] IRRIGATION STARTED (Soil: {self.current_soil_moisture:.1f}%)")
     
     def _turn_off(self):
         """Turn relay OFF (deactivate water pump)"""
@@ -485,7 +486,7 @@ class IrrigationController:
         if self.relay_active and self.last_activation_time:
             duration = time.time() - self.last_activation_time
             self.total_active_time += duration
-            print(f"\n⏸️  [RELAY] IRRIGATION STOPPED (Duration: {duration:.1f}s, Soil: {self.current_soil_moisture:.1f}%)")
+            print(f"\n[RELAY] IRRIGATION STOPPED (Duration: {duration:.1f}s, Soil: {self.current_soil_moisture:.1f}%)")
         
         self.relay_active = False
         self.last_activation_time = None
@@ -732,6 +733,7 @@ class AgricultureSNN:
         # Simulation state
         self.current_time = 0.0
         self.spike_count = 0
+        self.start_time = time.time()
         
         # Decision history
         self.decision_history = deque(maxlen=100)
@@ -739,6 +741,9 @@ class AgricultureSNN:
         
         print(f"[SNN] Network: {Config.SNN_INPUT_NEURONS} → {Config.SNN_HIDDEN_NEURONS} → {Config.SNN_OUTPUT_NEURONS}")
         print("[SNN] Learning: STDP (Spike-Timing Dependent Plasticity)")
+        print(f"[SNN] Learning Rate: {Config.SNN_LEARNING_RATE}")
+        print(f"[SNN] Expected pattern recognition: ~5 minutes")
+        print(f"[SNN] Optimal performance: ~15 minutes")
         print("[SNN] Initialized successfully")
     
     def _build_input_map(self) -> Dict[str, int]:
@@ -779,7 +784,13 @@ class AgricultureSNN:
         self.hidden_layer.stdp_update(hidden_spikes, output_spikes)
         
         # Update decisions (exponential moving average)
-        alpha = 0.1
+        # Faster adaptation during warmup period
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time < Config.SNN_WARMUP_PERIOD:
+            alpha = 0.3  # Faster learning during warmup (5 min)
+        else:
+            alpha = 0.1  # Stable decisions after warmup
+        
         for i, label in enumerate(self.decision_labels):
             self.current_decisions[label] = \
                 (1 - alpha) * self.current_decisions[label] + alpha * output_spikes[i]
@@ -796,7 +807,6 @@ class AgricultureSNN:
             })
         
         return self.current_decisions
-    
     def get_top_decisions(self, threshold: float = 0.3) -> List[Tuple[str, float]]:
         """
         Get active decisions above threshold
@@ -807,12 +817,35 @@ class AgricultureSNN:
         Returns:
             List of (decision_label, activation) tuples
         """
+        # Lower threshold during warmup for early feedback
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time < Config.SNN_WARMUP_PERIOD:
+            threshold = 0.05  # Much lower threshold during learning phase
+        
         active_decisions = [
             (label, activation)
             for label, activation in self.current_decisions.items()
             if activation > threshold
         ]
         return sorted(active_decisions, key=lambda x: x[1], reverse=True)
+    
+    def get_learning_progress(self) -> Tuple[float, str]:
+        """Get current learning progress percentage and status"""
+        elapsed_time = time.time() - self.start_time
+        progress = min(100.0, (elapsed_time / Config.SNN_WARMUP_PERIOD) * 100)
+        
+        if progress < 20:
+            status = "Initializing"
+        elif progress < 50:
+            status = "Learning patterns"
+        elif progress < 80:
+            status = "Refining decisions"
+        elif progress < 100:
+            status = "Stabilizing"
+        else:
+            status = "Optimal"
+        
+        return progress, status
     
     def get_recommendation(self) -> str:
         """
@@ -829,21 +862,21 @@ class AgricultureSNN:
         recommendations = []
         for decision, strength in top_decisions[:3]:
             if decision == 'irrigation_needed':
-                recommendations.append(f"💧 Irrigation recommended (confidence: {strength:.1%})")
+                recommendations.append(f"[WATER] Irrigation recommended (confidence: {strength:.1%})")
             elif decision == 'nutrient_deficiency':
-                recommendations.append(f"🌿 Check nutrient levels (confidence: {strength:.1%})")
+                recommendations.append(f"[NUTRIENT] Check nutrient levels (confidence: {strength:.1%})")
             elif decision == 'temperature_alert':
-                recommendations.append(f"🌡️  Temperature out of range (confidence: {strength:.1%})")
+                recommendations.append(f"[TEMP] Temperature out of range (confidence: {strength:.1%})")
             elif decision == 'humidity_alert':
-                recommendations.append(f"💨 Humidity adjustment needed (confidence: {strength:.1%})")
+                recommendations.append(f"[HUMID] Humidity adjustment needed (confidence: {strength:.1%})")
             elif decision == 'soil_dry':
-                recommendations.append(f"🏜️  Soil moisture low (confidence: {strength:.1%})")
+                recommendations.append(f"[SOIL] Soil moisture low (confidence: {strength:.1%})")
             elif decision == 'water_quality_low':
-                recommendations.append(f"💦 Water quality check needed (confidence: {strength:.1%})")
+                recommendations.append(f"[QUALITY] Water quality check needed (confidence: {strength:.1%})")
             elif decision == 'optimal_conditions':
-                recommendations.append(f"✅ Optimal growing conditions (confidence: {strength:.1%})")
+                recommendations.append(f"[OK] Optimal growing conditions (confidence: {strength:.1%})")
             elif decision == 'system_healthy':
-                recommendations.append(f"✅ System healthy (confidence: {strength:.1%})")
+                recommendations.append(f"[OK] System healthy (confidence: {strength:.1%})")
         
         return "\n".join(recommendations) if recommendations else "Analyzing data..."
     
@@ -1081,7 +1114,7 @@ class RealtimeVisualizer:
         
         # Sensor values
         units = {'temp': '°C', 'humid': '%', 'tds': 'ppm', 'soil': '%'}
-        icons = {'temp': '🌡️ ', 'humid': '💧', 'tds': '🧪', 'soil': '🌱'}
+        icons = {'temp': 'T:', 'humid': 'H:', 'tds': 'D:', 'soil': 'S:'}
         
         for sensor in Config.SENSOR_NAMES:
             if sensor in self.raw_values:
@@ -1091,7 +1124,7 @@ class RealtimeVisualizer:
                 
                 # Highlight soil moisture with relay status
                 if sensor == 'soil' and self.relay:
-                    relay_icon = '💦' if self.relay.relay_active else '  '
+                    relay_icon = '*' if self.relay.relay_active else ' '
                     if sensor == 'tds':
                         lines.append(f"│ {icon} {sensor.upper():5s}: {value:5.0f} {unit:<7}│")
                     else:
@@ -1108,7 +1141,7 @@ class RealtimeVisualizer:
         if self.relay:
             lines.append("╠═══ IRRIGATION RELAY ═══════╣")
             status = self.relay.get_status()
-            relay_state = "ON 💦" if status['active'] else "OFF"
+            relay_state = "ON" if status['active'] else "OFF"
             lines.append(f"│ Status: {relay_state:18s} │")
             if status['soil_moisture'] is not None:
                 lines.append(f"│ Threshold: {self.relay.low_threshold:.0f}%-{self.relay.high_threshold:.0f}%        │")
@@ -1132,6 +1165,14 @@ class RealtimeVisualizer:
         # SNN Decisions
         if self.snn:
             lines.append("╠═══ SNN DECISIONS ═════════╣")
+            
+            # Show learning progress
+            progress, status = self.snn.get_learning_progress()
+            lines.append(f"│ Learning: {progress:3.0f}% {status:12s}│")
+            
+            # Show spike count for debugging
+            lines.append(f"│ Spikes: {self.snn.spike_count:<17}│")
+            
             top_decisions = self.snn.get_top_decisions(threshold=0.2)
             if top_decisions:
                 for decision, strength in top_decisions[:3]:
@@ -1140,7 +1181,16 @@ class RealtimeVisualizer:
                     bar = '█' * bar_length + '░' * (10 - bar_length)
                     lines.append(f"│ {label:15s} {bar} │")
             else:
-                lines.append("│ Analyzing patterns...     │")
+                # Show current decision values even if below threshold
+                max_decision = max(self.snn.current_decisions.items(), key=lambda x: x[1])
+                if max_decision[1] > 0.01:
+                    label = max_decision[0].replace('_', ' ').title()[:15]
+                    strength = max_decision[1]
+                    bar_length = int(strength * 10)
+                    bar = '█' * bar_length + '░' * (10 - bar_length)
+                    lines.append(f"│ {label:15s} {bar} │")
+                else:
+                    lines.append("│ Waiting for data...       │")
         
         lines.append("╚═══════════════════════════╝")
         
@@ -1229,12 +1279,12 @@ def main():
     print("\n" + "="*50)
     print("WIRELESS MONITORING ACTIVE")
     print("="*50)
-    print(f"📝 Logging to: {log_filename}")
-    print("📡 Waiting for Pico transmitter...")
-    print(f"🧠 SNN Brain: {Config.SNN_INPUT_NEURONS}→{Config.SNN_HIDDEN_NEURONS}→{Config.SNN_OUTPUT_NEURONS} neurons")
-    print("🎯 Decision-making: ACTIVE")
+    print(f"[LOG] Logging to: {log_filename}")
+    print(f"[RF24] Waiting for Pico transmitter...")
+    print(f"[SNN] Brain: {Config.SNN_INPUT_NEURONS}→{Config.SNN_HIDDEN_NEURONS}→{Config.SNN_OUTPUT_NEURONS} neurons")
+    print("[AI] Decision-making: ACTIVE")
     if relay:
-        print(f"💧 Irrigation Relay: GPIO{Config.RELAY_PIN} ({Config.SOIL_MOISTURE_LOW_THRESHOLD}%-{Config.SOIL_MOISTURE_HIGH_THRESHOLD}%)")
+        print(f"[RELAY] Irrigation: GPIO{Config.RELAY_PIN} ({Config.SOIL_MOISTURE_LOW_THRESHOLD}%-{Config.SOIL_MOISTURE_HIGH_THRESHOLD}%)")
     print("Press Ctrl+C to stop")
     print("="*50 + "\n")
     
